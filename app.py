@@ -57,6 +57,19 @@ def register():
     return jsonify({"message": "User registered successfully!"})
 
 
+# Add this to your app.py
+
+@app.route("/")
+def index():
+    # You can return a simple string
+    return "API is running!"
+
+    # Or, for an API, it's common to return JSON
+    # from flask import jsonify
+    # return jsonify({"status": "Server is running"})
+
+
+
 @app.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
