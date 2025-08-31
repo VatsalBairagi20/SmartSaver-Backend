@@ -1,52 +1,47 @@
+import os
+import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
 import bcrypt
-import jwt
-import datetime
 from bson import ObjectId
-import os
-from dotenv import load_dotenv
-
-# Load variables from the .env file
-load_dotenv()
+from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager
 
 app = Flask(__name__)
 CORS(app)
 
-# --- CORRECTLY CONFIGURED SECTION ---
-# Secret key for JWT is now loaded from the environment
-app.config['SECRET_KEY'] = os.getenv("SECRET_KEY")
+# --- CONFIGURATION ---
+# Use the correct key that Flask-JWT-Extended expects
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY")
+jwt = JWTManager(app)
 
-# MongoDB connection is now loaded from the environment
-MONGO_URI = os.getenv("MONGO_URI")
+# MongoDB connection
+MONGO_URI = os.environ.get("MONGO_URI")
 client = MongoClient(MONGO_URI)
-# --- END OF SECTION ---
+# --- END CONFIGURATION ---
 
 db = client["SmartSaver"]
 users = db["users"]
 goals = db["goals"]
 transactions = db["transactions"]
 
-# ------------------ Helpers ------------------
-def decode_token(token):
-    try:
-        # Handle both "Bearer <token>" and plain token formats
-        if token and token.startswith("Bearer "):
-            token = token[7:]  # Remove "Bearer " prefix
+# ------------------ Routes ------------------
 
-        return jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-    except Exception as e:
-        print(f"Token decode error: {e}")
-        return None
+# Health check route for Render
+@app.route("/")
+def index():
+    return jsonify({"status": "API is running!"})
 
-# ------------------ Auth ------------------
+# --- Auth Routes ---
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
-    name = data['name']
-    email = data['email']
-    password = data['password']
+    name = data.get('name')
+    email = data.get('email')
+    password = data.get('password')
+
+    if not all([name, email, password]):
+        return jsonify({"error": "Missing name, email, or password"}), 400
 
     if users.find_one({"email": email}):
         return jsonify({"error": "User already exists"}), 400
@@ -54,231 +49,130 @@ def register():
     hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
     users.insert_one({"name": name, "email": email, "password": hashed_pw})
 
-    return jsonify({"message": "User registered successfully!"})
-
-
-# Add this to your app.py
-
-@app.route("/")
-def index():
-    # You can return a simple string
-    return "API is running!"
-
-    # Or, for an API, it's common to return JSON
-    # from flask import jsonify
-    # return jsonify({"status": "Server is running"})
-
-
+    return jsonify({"message": "User registered successfully!"}), 201
 
 @app.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
-    email = data['email']
-    password = data['password']
+    email = data.get('email')
+    password = data.get('password')
+
+    if not all([email, password]):
+        return jsonify({"error": "Missing email or password"}), 400
 
     user = users.find_one({"email": email})
-    if not user:
-        return jsonify({"error": "Invalid email"}), 401
+    if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password']):
+        return jsonify({"error": "Invalid email or password"}), 401
 
-    if bcrypt.checkpw(password.encode('utf-8'), user['password']):
-        token = jwt.encode({
-            "user_id": str(user["_id"]),
-            "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)
-        }, app.config['SECRET_KEY'], algorithm="HS256")
+    # Create token using Flask-JWT-Extended
+    access_token = create_access_token(identity=str(user["_id"]))
+    return jsonify(access_token=access_token)
 
-        return jsonify({"token": token})
-    else:
-        return jsonify({"error": "Invalid password"}), 401
-
-
+# --- User Profile Routes ---
 @app.route('/me', methods=['GET'])
+@jwt_required()
 def get_profile():
-    token = request.headers.get("Authorization")
-    decoded = decode_token(token)
-    if not decoded:
-        return jsonify({"error": "Invalid or missing token"}), 401
-
-    user = users.find_one({"_id": ObjectId(decoded['user_id'])})
+    current_user_id = get_jwt_identity()
+    user = users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        return jsonify({"error": "User not found"}), 404
     return jsonify({"email": user['email'], "name": user['name']})
 
-
 @app.route('/me', methods=['PUT'])
+@jwt_required()
 def update_profile():
-    try:
-        token = request.headers.get("Authorization")
-        decoded = decode_token(token)
-        if not decoded:
-            return jsonify({"error": "Invalid or missing token"}), 401
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+    if not data or 'name' not in data or not data['name'].strip():
+        return jsonify({"error": "Name field is required"}), 400
 
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No data provided"}), 400
-
-        update_data = {}
-        if 'name' in data and data['name'].strip():
-            update_data['name'] = data['name'].strip()
-
-        if not update_data:
-            return jsonify({"error": "No valid fields to update"}), 400
-
-        result = users.update_one(
-            {"_id": ObjectId(decoded['user_id'])},
-            {"$set": update_data}
-        )
-
-        if result.modified_count == 0:
-            return jsonify({"error": "Profile not updated"}), 400
-
-        return jsonify({"message": "Profile updated successfully"})
-    except Exception as e:
-        print(f"Update profile error: {e}")
-        return jsonify({"error": "Failed to update profile"}), 500
-
+    update_data = {'name': data['name'].strip()}
+    users.update_one({"_id": ObjectId(current_user_id)}, {"$set": update_data})
+    return jsonify({"message": "Profile updated successfully"})
 
 @app.route('/me/password', methods=['PUT'])
+@jwt_required()
 def change_password():
-    try:
-        token = request.headers.get("Authorization")
-        decoded = decode_token(token)
-        if not decoded:
-            return jsonify({"error": "Invalid or missing token"}), 401
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+    current_password = data.get('current_password')
+    new_password = data.get('new_password')
 
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No data provided"}), 400
+    if not all([current_password, new_password]):
+        return jsonify({"error": "Current and new password are required"}), 400
 
-        current_password = data.get('current_password', '')
-        new_password = data.get('new_password', '')
+    user = users.find_one({"_id": ObjectId(current_user_id)})
+    if not user or not bcrypt.checkpw(current_password.encode('utf-8'), user['password']):
+        return jsonify({"error": "Current password is incorrect"}), 400
 
-        if not current_password or not new_password:
-            return jsonify({"error": "Current and new password are required"}), 400
-
-        if len(new_password) < 6:
-            return jsonify({"error": "New password must be at least 6 characters"}), 400
-
-        user = users.find_one({"_id": ObjectId(decoded['user_id'])})
-        if not user:
-            return jsonify({"error": "User not found"}), 404
-
-        if not bcrypt.checkpw(current_password.encode('utf-8'), user['password']):
-            return jsonify({"error": "Current password is incorrect"}), 400
-
-        hashed_new_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
-        result = users.update_one(
-            {"_id": ObjectId(decoded['user_id'])},
-            {"$set": {"password": hashed_new_password}}
-        )
-
-        if result.modified_count == 0:
-            return jsonify({"error": "Password not updated"}), 400
-
-        return jsonify({"message": "Password changed successfully"})
-    except Exception as e:
-        print(f"Change password error: {e}")
-        return jsonify({"error": "Failed to change password"}), 500
-
+    hashed_new_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
+    users.update_one({"_id": ObjectId(current_user_id)}, {"$set": {"password": hashed_new_password}})
+    return jsonify({"message": "Password changed successfully"})
 
 @app.route('/me', methods=['DELETE'])
+@jwt_required()
 def delete_account():
-    try:
-        token = request.headers.get("Authorization")
-        decoded = decode_token(token)
-        if not decoded:
-            return jsonify({"error": "Invalid or missing token"}), 401
+    current_user_id = get_jwt_identity()
+    # cascade delete goals and transactions
+    user_goals = list(goals.find({"user_id": current_user_id}))
+    goal_ids = [str(goal["_id"]) for goal in user_goals]
+    if goal_ids:
+        transactions.delete_many({"goal_id": {"$in": goal_ids}})
+    goals.delete_many({"user_id": current_user_id})
+    users.delete_one({"_id": ObjectId(current_user_id)})
+    return jsonify({"message": "Account deleted successfully"})
 
-        user_id = decoded['user_id']
-
-        # Delete user's goals
-        goals.delete_many({"user_id": user_id})
-
-        # Delete user's transactions
-        user_goals = list(goals.find({"user_id": user_id}))
-        goal_ids = [str(goal["_id"]) for goal in user_goals]
-        if goal_ids:
-            transactions.delete_many({"goal_id": {"$in": goal_ids}})
-
-        # Delete user
-        result = users.delete_one({"_id": ObjectId(user_id)})
-        if result.deleted_count == 0:
-            return jsonify({"error": "User not found"}), 404
-
-        return jsonify({"message": "Account deleted successfully"})
-    except Exception as e:
-        print(f"Delete account error: {e}")
-        return jsonify({"error": "Failed to delete account"}), 500
-
-
-# ------------------ Goals ------------------
+# --- Goal Routes ---
 @app.route('/goals', methods=['POST'])
+@jwt_required()
 def create_goal():
-    token = request.headers.get("Authorization")
-    decoded = decode_token(token)
-    if not decoded:
-        return jsonify({"error": "Invalid or missing token"}), 401
-
+    current_user_id = get_jwt_identity()
     data = request.get_json()
     
     goal = {
-        "user_id": decoded["user_id"],
+        "user_id": current_user_id,
         "name": data["name"],
         "target": data["target"],
         "saved": 0,
         "icon": data.get("icon", "🎯"),
-        "created_at": datetime.datetime.utcnow()
+        "created_at": datetime.datetime.now(datetime.timezone.utc)
     }
-    
     result = goals.insert_one(goal)
     goal["_id"] = str(result.inserted_id)
-    
     return jsonify(goal), 201
 
-
 @app.route('/goals', methods=['GET'])
+@jwt_required()
 def get_goals():
-    token = request.headers.get("Authorization")
-    decoded = decode_token(token)
-    if not decoded:
-        return jsonify({"error": "Invalid or missing token"}), 401
-    
-    user_goals = list(goals.find({"user_id": decoded["user_id"]}))
-    
+    current_user_id = get_jwt_identity()
+    user_goals = list(goals.find({"user_id": current_user_id}))
     for g in user_goals:
         g["_id"] = str(g["_id"])
-    
     return jsonify(user_goals)
 
-
 @app.route('/goals/<goal_id>', methods=['GET'])
+@jwt_required()
 def get_goal(goal_id):
-    token = request.headers.get("Authorization")
-    decoded = decode_token(token)
-    if not decoded:
-        return jsonify({"error": "Invalid or missing token"}), 401
-
-    goal = goals.find_one({"_id": ObjectId(goal_id), "user_id": decoded["user_id"]})
+    current_user_id = get_jwt_identity()
+    goal = goals.find_one({"_id": ObjectId(goal_id), "user_id": current_user_id})
     if not goal:
         return jsonify({"error": "Goal not found"}), 404
 
     goal["_id"] = str(goal["_id"])
-
-    txns = list(transactions.find({"goal_id": goal["_id"]}).sort("date", -1))
+    txns = list(transactions.find({"goal_id": goal_id}).sort("date", -1))
     for t in txns:
         t["_id"] = str(t["_id"])
     return jsonify({"goal": goal, "transactions": txns})
 
-
 @app.route('/goals/<goal_id>/add', methods=['POST'])
+@jwt_required()
 def add_money(goal_id):
-    token = request.headers.get("Authorization")
-    decoded = decode_token(token)
-    if not decoded:
-        return jsonify({"error": "Invalid or missing token"}), 401
-
+    current_user_id = get_jwt_identity()
     data = request.get_json()
     amount = data.get("amount", 0)
 
     result = goals.update_one(
-        {"_id": ObjectId(goal_id), "user_id": decoded["user_id"]},
+        {"_id": ObjectId(goal_id), "user_id": current_user_id},
         {"$inc": {"saved": amount}}
     )
 
@@ -288,18 +182,46 @@ def add_money(goal_id):
     txn = {
         "goal_id": goal_id,
         "amount": amount,
-        "date": datetime.datetime.utcnow()
+        "date": datetime.datetime.now(datetime.timezone.utc)
     }
     transactions.insert_one(txn)
-
     return jsonify({"message": "Money added!"})
 
+# Add a withdraw money route
+@app.route('/goals/<goal_id>/withdraw', methods=['POST'])
+@jwt_required()
+def withdraw_money(goal_id):
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+    amount = data.get("amount", 0)
+
+    # Ensure withdrawal amount is positive
+    if amount <= 0:
+        return jsonify({"error": "Amount must be positive"}), 400
+
+    goal = goals.find_one({"_id": ObjectId(goal_id), "user_id": current_user_id})
+    if not goal:
+        return jsonify({"error": "Goal not found"}), 404
+    
+    if amount > goal['saved']:
+        return jsonify({"error": "Withdrawal amount exceeds saved amount"}), 400
+
+    result = goals.update_one(
+        {"_id": ObjectId(goal_id)},
+        {"$inc": {"saved": -amount}}
+    )
+
+    if result.modified_count == 0:
+        return jsonify({"error": "Failed to withdraw money"}), 400
+
+    txn = {
+        "goal_id": goal_id,
+        "amount": -amount,  # Store withdrawal as a negative amount
+        "date": datetime.datetime.now(datetime.timezone.utc)
+    }
+    transactions.insert_one(txn)
+    return jsonify({"message": "Money withdrawn!"})
 
 # ------------------ Run ------------------
-@app.errorhandler(Exception)
-def handle_exception(e):
-    print(f"Unhandled exception: {e}")
-    return jsonify({"error": "Internal server error"}), 500
-
 if __name__ == '__main__':
     app.run(debug=True)
