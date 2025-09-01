@@ -3,27 +3,40 @@ import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 import bcrypt
 from bson import ObjectId
+from bson.errors import InvalidId
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager
 
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIGURATION ---
-# Use the correct key that Flask-JWT-Extended expects
-app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY")
+# --- CONFIGURATION & STARTUP CHECKS ---
+# NEW: Check for required environment variables on startup for failsafe deployment
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
+MONGO_URI = os.environ.get("MONGO_URI")
+
+if not JWT_SECRET_KEY or not MONGO_URI:
+    raise RuntimeError("FATAL: JWT_SECRET_KEY and MONGO_URI must be set in the environment.")
+
+app.config["JWT_SECRET_KEY"] = JWT_SECRET_KEY
 jwt = JWTManager(app)
 
-# MongoDB connection
-MONGO_URI = os.environ.get("MONGO_URI")
-client = MongoClient(MONGO_URI)
-# --- END CONFIGURATION ---
+# NEW: Establish and test MongoDB connection within a try-except block
+try:
+    client = MongoClient(MONGO_URI)
+    # The ismaster command is cheap and does not require auth.
+    client.admin.command('ismaster')
+    print("MongoDB connection successful.")
+except ConnectionFailure as e:
+    raise RuntimeError(f"MongoDB connection failed: {e}")
 
 db = client["SmartSaver"]
 users = db["users"]
 goals = db["goals"]
 transactions = db["transactions"]
+# --- END CONFIGURATION ---
 
 # ------------------ Routes ------------------
 
@@ -36,6 +49,7 @@ def index():
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
+    # IMPROVED: Use .get() for safer access and check for missing data
     name = data.get('name')
     email = data.get('email')
     password = data.get('password')
@@ -48,7 +62,6 @@ def register():
 
     hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
     users.insert_one({"name": name, "email": email, "password": hashed_pw})
-
     return jsonify({"message": "User registered successfully!"}), 201
 
 @app.route('/login', methods=['POST'])
@@ -64,7 +77,6 @@ def login():
     if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password']):
         return jsonify({"error": "Invalid email or password"}), 401
 
-    # Create token using Flask-JWT-Extended
     access_token = create_access_token(identity=str(user["_id"]))
     return jsonify(access_token=access_token)
 
@@ -76,51 +88,12 @@ def get_profile():
     user = users.find_one({"_id": ObjectId(current_user_id)})
     if not user:
         return jsonify({"error": "User not found"}), 404
-    return jsonify({"email": user['email'], "name": user['name']})
-
-@app.route('/me', methods=['PUT'])
-@jwt_required()
-def update_profile():
-    current_user_id = get_jwt_identity()
-    data = request.get_json()
-    if not data or 'name' not in data or not data['name'].strip():
-        return jsonify({"error": "Name field is required"}), 400
-
-    update_data = {'name': data['name'].strip()}
-    users.update_one({"_id": ObjectId(current_user_id)}, {"$set": update_data})
-    return jsonify({"message": "Profile updated successfully"})
-
-@app.route('/me/password', methods=['PUT'])
-@jwt_required()
-def change_password():
-    current_user_id = get_jwt_identity()
-    data = request.get_json()
-    current_password = data.get('current_password')
-    new_password = data.get('new_password')
-
-    if not all([current_password, new_password]):
-        return jsonify({"error": "Current and new password are required"}), 400
-
-    user = users.find_one({"_id": ObjectId(current_user_id)})
-    if not user or not bcrypt.checkpw(current_password.encode('utf-8'), user['password']):
-        return jsonify({"error": "Current password is incorrect"}), 400
-
-    hashed_new_password = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
-    users.update_one({"_id": ObjectId(current_user_id)}, {"$set": {"password": hashed_new_password}})
-    return jsonify({"message": "Password changed successfully"})
-
-@app.route('/me', methods=['DELETE'])
-@jwt_required()
-def delete_account():
-    current_user_id = get_jwt_identity()
-    # cascade delete goals and transactions
-    user_goals = list(goals.find({"user_id": current_user_id}))
-    goal_ids = [str(goal["_id"]) for goal in user_goals]
-    if goal_ids:
-        transactions.delete_many({"goal_id": {"$in": goal_ids}})
-    goals.delete_many({"user_id": current_user_id})
-    users.delete_one({"_id": ObjectId(current_user_id)})
-    return jsonify({"message": "Account deleted successfully"})
+    # IMPROVED: Don't return the full user object, just the necessary fields
+    return jsonify({
+        "id": str(user["_id"]),
+        "email": user['email'],
+        "name": user['name']
+    })
 
 # --- Goal Routes ---
 @app.route('/goals', methods=['POST'])
@@ -128,11 +101,23 @@ def delete_account():
 def create_goal():
     current_user_id = get_jwt_identity()
     data = request.get_json()
+    name = data.get("name")
+    target = data.get("target")
+
+    if not name or target is None:
+        return jsonify({"error": "Goal name and target are required"}), 400
+    
+    try:
+        target_amount = float(target)
+        if target_amount <= 0:
+             return jsonify({"error": "Target must be a positive number"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "Target must be a valid number"}), 400
     
     goal = {
         "user_id": current_user_id,
-        "name": data["name"],
-        "target": data["target"],
+        "name": name,
+        "target": target_amount,
         "saved": 0,
         "icon": data.get("icon", "🎯"),
         "created_at": datetime.datetime.now(datetime.timezone.utc)
@@ -154,26 +139,52 @@ def get_goals():
 @jwt_required()
 def get_goal(goal_id):
     current_user_id = get_jwt_identity()
-    goal = goals.find_one({"_id": ObjectId(goal_id), "user_id": current_user_id})
+    # IMPROVED: Add error handling for invalid ID formats
+    try:
+        obj_goal_id = ObjectId(goal_id)
+    except InvalidId:
+        return jsonify({"error": "Invalid goal ID format"}), 400
+
+    goal = goals.find_one({"_id": obj_goal_id, "user_id": current_user_id})
     if not goal:
         return jsonify({"error": "Goal not found"}), 404
 
     goal["_id"] = str(goal["_id"])
+    # Find transactions related to this goal's string ID
     txns = list(transactions.find({"goal_id": goal_id}).sort("date", -1))
     for t in txns:
         t["_id"] = str(t["_id"])
     return jsonify({"goal": goal, "transactions": txns})
 
-@app.route('/goals/<goal_id>/add', methods=['POST'])
+# --- Transaction Routes ---
+@app.route('/goals/<goal_id>/transaction', methods=['POST'])
 @jwt_required()
-def add_money(goal_id):
+def add_transaction(goal_id):
     current_user_id = get_jwt_identity()
     data = request.get_json()
     amount = data.get("amount", 0)
 
+    try:
+        transaction_amount = float(amount)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Amount must be a valid number"}), 400
+
+    try:
+        obj_goal_id = ObjectId(goal_id)
+    except InvalidId:
+        return jsonify({"error": "Invalid goal ID format"}), 400
+
+    goal = goals.find_one({"_id": obj_goal_id, "user_id": current_user_id})
+    if not goal:
+        return jsonify({"error": "Goal not found"}), 404
+    
+    # Prevent withdrawing more than available
+    if goal['saved'] + transaction_amount < 0:
+        return jsonify({"error": "Transaction amount exceeds saved balance"}), 400
+
     result = goals.update_one(
-        {"_id": ObjectId(goal_id), "user_id": current_user_id},
-        {"$inc": {"saved": amount}}
+        {"_id": obj_goal_id},
+        {"$inc": {"saved": transaction_amount}}
     )
 
     if result.modified_count == 0:
@@ -181,47 +192,41 @@ def add_money(goal_id):
 
     txn = {
         "goal_id": goal_id,
-        "amount": amount,
+        "amount": transaction_amount,
         "date": datetime.datetime.now(datetime.timezone.utc)
     }
     transactions.insert_one(txn)
-    return jsonify({"message": "Money added!"})
+    return jsonify({"message": f"Transaction of {transaction_amount} recorded!"})
 
-# Add a withdraw money route
-@app.route('/goals/<goal_id>/withdraw', methods=['POST'])
+# --- Dashboard Route ---
+# NEW: A route to get overall stats for the dashboard screen
+@app.route('/dashboard', methods=['GET'])
 @jwt_required()
-def withdraw_money(goal_id):
+def get_dashboard_stats():
     current_user_id = get_jwt_identity()
-    data = request.get_json()
-    amount = data.get("amount", 0)
-
-    # Ensure withdrawal amount is positive
-    if amount <= 0:
-        return jsonify({"error": "Amount must be positive"}), 400
-
-    goal = goals.find_one({"_id": ObjectId(goal_id), "user_id": current_user_id})
-    if not goal:
-        return jsonify({"error": "Goal not found"}), 404
     
-    if amount > goal['saved']:
-        return jsonify({"error": "Withdrawal amount exceeds saved amount"}), 400
-
-    result = goals.update_one(
-        {"_id": ObjectId(goal_id)},
-        {"$inc": {"saved": -amount}}
-    )
-
-    if result.modified_count == 0:
-        return jsonify({"error": "Failed to withdraw money"}), 400
-
-    txn = {
-        "goal_id": goal_id,
-        "amount": -amount,  # Store withdrawal as a negative amount
-        "date": datetime.datetime.now(datetime.timezone.utc)
-    }
-    transactions.insert_one(txn)
-    return jsonify({"message": "Money withdrawn!"})
+    pipeline = [
+        {"$match": {"user_id": current_user_id}},
+        {"$group": {
+            "_id": None,
+            "total_saved": {"$sum": "$saved"},
+            "total_target": {"$sum": "$target"},
+            "goals_count": {"$sum": 1}
+        }}
+    ]
+    
+    stats = list(goals.aggregate(pipeline))
+    
+    if not stats:
+        return jsonify({
+            "total_saved": 0,
+            "total_target": 0,
+            "goals_count": 0,
+        })
+    
+    return jsonify(stats[0])
 
 # ------------------ Run ------------------
 if __name__ == '__main__':
-    app.run(debug=True)
+    # This block is for local development only. Gunicorn will run the app in production.
+    app.run(debug=True, port=5000)
